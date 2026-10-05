@@ -1,0 +1,68 @@
+name: AI Conflict Resolver
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  resolve-conflicts:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          # Attempt to merge main branch to trigger conflicts if they exist
+          git fetch origin main
+          git merge origin/main --no-commit --no-ff || true
+
+      - name: Resolve Conflicts using Groq AI
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          # Find files with merge conflicts
+          CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
+          
+          if [ -z "$CONFLICT_FILES" ]; then
+            echo "No merge conflicts found. Exiting."
+            exit 0
+          fi
+
+          for FILE in $CONFLICT_FILES; do
+            echo "Resolving conflicts in $FILE"
+            # Read the conflicted file content safely
+            CONTENT=$(cat "$FILE")
+            
+            # Call Groq API to resolve the conflict
+            RESPONSE=$(curl -s https://api.groq.com/openai/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $GROQ_API_KEY" \
+              -d "{
+                \"model\": \"llama3-8b-8192\",
+                \"messages\": [
+                  {\"role\": \"system\", \"content\": \"You are a code merging assistant. The user will provide a file with Git merge conflicts (marked by <<<<<<<, =======, >>>>>>>). Resolve the conflict logically by combining both changes. Return ONLY the final clean code without any conflict markers or explanations.\"},
+                  {\"role\": \"user\", \"content\": $(echo "$CONTENT" | jq -Rs .)}
+                ]
+              }")
+            
+            # Extract the resolved code
+            RESOLVED_CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
+            
+            # Write the resolved content back to the file
+            echo "$RESOLVED_CONTENT" > "$FILE"
+            git add "$FILE"
+          done
+
+          # Commit the resolved files back to the PR branch
+          git commit -m "🤖 AI auto-resolved merge conflicts"
+          git push
