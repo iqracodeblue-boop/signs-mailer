@@ -1,15 +1,82 @@
-function getUserInfo(userId) {
-    // Bug 1: SQL Injection vulnerability
-    const query = "SELECT * FROM users WHERE id = " + userId;
+name: Custom AI PR Reviewer (Free)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  custom-review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      statuses: write
+      contents: read
     
-    // Bug 2: Undefined variable usage (will crash the app)
-    const role = userRole;
-    
-    // Bug 3: Potential null pointer error (user object might be empty)
-    const name = user.profile.name;
-    
-    // Bug 4: Console log left in production code
-    console.log("Query executed:", query);
-    
-    return query;
-}
+    steps:
+      - name: Run Custom AI Review (Groq - Free)
+        uses: actions/github-script@v6
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        with:
+          script: |
+            const { data: diff } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              mediaType: { format: 'application/vnd.github.v3.diff' }
+            });
+
+            let commentBody = "### 🤖 Custom AI Code Review\n\nAI could not review the code due to an internal error.";
+            let hasIssues = true;
+
+            try {
+              const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
+                },
+                body: JSON.stringify({
+                  model: 'llama3-8b-8192',
+                  messages: [
+                    { role: 'system', content: 'You are an expert code reviewer. Review the following GitHub PR diff. Identify critical bugs, security vulnerabilities, and regressions. Return ONLY a JSON object with "has_critical_issues" (boolean true/false) and "review_comment" (markdown string with findings and fix recommendations).' },
+                    { role: 'user', content: diff }
+                  ]
+                })
+              });
+              
+              const groqData = await groqResponse.json();
+              
+              if (groqData.choices && groqData.choices.length > 0) {
+                let content = groqData.choices[0].message.content;
+                content = content.replace(/```json\n|```/g, '').trim();
+                
+                try {
+                  const review = JSON.parse(content);
+                  commentBody = `### 🤖 Custom AI Code Review\n\n${review.review_comment}`;
+                  hasIssues = review.has_critical_issues === true;
+                } catch (e) {
+                  commentBody = `### 🤖 Custom AI Code Review\n\n${content}`;
+                }
+              } else {
+                  commentBody = `### 🤖 Custom AI Code Review\n\nAPI returned no response. Please check Groq API key.`;
+              }
+            } catch (error) {
+              commentBody = `### 🤖 Custom AI Code Review\n\nError fetching review: ${error.message}`;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: commentBody
+            });
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: hasIssues ? 'failure' : 'success',
+              description: hasIssues ? 'Critical bugs detected. Merge blocked.' : 'No critical issues. Ready to merge.',
+              context: 'Custom AI PR Reviewer'
+            });
