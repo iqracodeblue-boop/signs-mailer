@@ -1,4 +1,4 @@
-name: Custom AI PR Reviewer
+name: Custom AI PR Reviewer (Inline API)
 
 on:
   pull_request:
@@ -16,10 +16,10 @@ jobs:
       - name: Run Custom AI Review
         uses: actions/github-script@v6
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         with:
           script: |
-            // 1. Fetch PR diff using GitHub API
+            // 1. Fetch PR diff
             const { data: diff } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -27,43 +27,72 @@ jobs:
               mediaType: { format: 'application/vnd.github.v3.diff' }
             });
 
-            // 2. Call OpenAI API for Bug Detection
-            const openAiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-              },
-              body: JSON.stringify({
-                model: 'gpt-4o',
-                messages: [
-                  { role: 'system', content: 'You are an expert code reviewer. Review the following GitHub PR diff. Identify critical bugs, security vulnerabilities, and regressions. Return ONLY a JSON object with "has_critical_issues" (boolean true/false) and "review_comment" (markdown string with findings and fix recommendations).' },
-                  { role: 'user', content: diff }
-                ]
-              })
-            });
-            
-            const openAiData = await openAiResponse.json();
-            let content = openAiData.choices[0].message.content;
-            
-            // Clean up response to ensure it's valid JSON
-            content = content.replace(/```json\n|```/g, '').trim();
-            const review = JSON.parse(content);
+            let reviewEvent = 'COMMENT';
+            let reviewBody = "### 🤖 Custom AI Code Review\n\nCode analyzed successfully.";
+            let inlineComments = [];
+            let hasIssues = true;
 
-            // 3. Post comment on PR using GitHub API
-            await github.rest.issues.createComment({
+            try {
+              // 2. Call Groq AI with specific instructions for inline comments
+              const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
+                },
+                body: JSON.stringify({
+                  model: 'llama3-8b-8192',
+                  messages: [
+                    { role: 'system', content: 'You are an expert code reviewer. Review the GitHub PR diff. Identify critical bugs. Return ONLY a JSON object with "has_critical_issues" (boolean), "summary" (string), and "comments" (array of objects with "path" (filename), "line" (integer line number from the diff), and "body" (review comment for that line)).' },
+                    { role: 'user', content: diff }
+                  ]
+                })
+              });
+              
+              const groqData = await groqResponse.json();
+              
+              if (groqData.choices && groqData.choices.length > 0) {
+                let content = groqData.choices[0].message.content;
+                content = content.replace(/```json\n|```/g, '').trim();
+                
+                try {
+                  const review = JSON.parse(content);
+                  reviewBody = `### 🤖 Custom AI Code Review\n\n${review.summary || "Review complete."}`;
+                  hasIssues = review.has_critical_issues === true;
+                  
+                  if (review.comments && review.comments.length > 0) {
+                    inlineComments = review.comments.map(c => ({
+                      path: c.path,
+                      line: c.line,
+                      body: c.body
+                    }));
+                  }
+                } catch (e) {
+                  reviewBody = `### 🤖 Custom AI Code Review\n\n${content}`;
+                }
+              } else if (groqData.error) {
+                  reviewBody = `### 🤖 Custom AI Code Review\n\n**API Error:** ${groqData.error.message}`;
+              }
+            } catch (error) {
+              reviewBody = `### 🤖 Custom AI Code Review\n\nError fetching review: ${error.message}`;
+            }
+
+            // 3. Use GitHub Review API for Inline Comments
+            await github.rest.pulls.createReview({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body: `### 🤖 Custom AI Code Review\n\n${review.review_comment}`
+              pull_number: context.payload.pull_request.number,
+              body: reviewBody,
+              event: hasIssues ? 'REQUEST_CHANGES' : 'COMMENT',
+              comments: inlineComments
             });
 
-            // 4. Set Quality Gate (Block merge if critical issues found)
+            // 4. Set Status Check (Block Merge if issues found)
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
               sha: context.payload.pull_request.head.sha,
-              state: review.has_critical_issues ? 'failure' : 'success',
-              description: review.has_critical_issues ? 'Critical bugs detected. Merge blocked.' : 'No critical issues. Ready to merge.',
+              state: hasIssues ? 'failure' : 'success',
+              description: hasIssues ? 'Critical bugs detected. Merge blocked.' : 'No critical issues. Ready to merge.',
               context: 'Custom AI PR Reviewer'
             });
